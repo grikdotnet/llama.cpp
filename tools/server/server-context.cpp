@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
+#include <cctype>
 #include <exception>
 #include <memory>
 #include <filesystem>
@@ -3677,6 +3678,312 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
     return res;
 }
 
+static raw_buffer server_audio_stream_base64_decode(const std::string & encoded_string) {
+    static const std::string chars =
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+            "abcdefghijklmnopqrstuvwxyz"
+            "0123456789+/";
+
+    auto is_base64 = [](unsigned char c) {
+        return std::isalnum(c) || c == '+' || c == '/';
+    };
+
+    int in_len = encoded_string.size();
+    int i = 0;
+    int in_ = 0;
+    unsigned char char_array_4[4], char_array_3[3];
+    raw_buffer ret;
+
+    while (in_len-- && encoded_string[in_] != '=' && is_base64(encoded_string[in_])) {
+        char_array_4[i++] = encoded_string[in_]; in_++;
+        if (i == 4) {
+            for (i = 0; i < 4; i++) {
+                char_array_4[i] = chars.find(char_array_4[i]);
+            }
+
+            char_array_3[0] = (char_array_4[0] << 2) + ((char_array_4[1] & 0x30) >> 4);
+            char_array_3[1] = ((char_array_4[1] & 0xf) << 4) + ((char_array_4[2] & 0x3c) >> 2);
+            char_array_3[2] = ((char_array_4[2] & 0x3) << 6) + char_array_4[3];
+
+            for (i = 0; i < 3; i++) {
+                ret.push_back(char_array_3[i]);
+            }
+            i = 0;
+        }
+    }
+
+    if (i) {
+        for (int j = i; j < 4; j++) {
+            char_array_4[j] = 0;
+        }
+        for (int j = 0; j < 4; j++) {
+            char_array_4[j] = chars.find(char_array_4[j]);
+        }
+
+        char_array_3[0] = (char_array_4[0] << 2) + ((char_array_4[1] & 0x30) >> 4);
+        char_array_3[1] = ((char_array_4[1] & 0xf) << 4) + ((char_array_4[2] & 0x3c) >> 2);
+        char_array_3[2] = ((char_array_4[2] & 0x3) << 6) + char_array_4[3];
+
+        for (int j = 0; j < i - 1; j++) {
+            ret.push_back(char_array_3[j]);
+        }
+    }
+
+    return ret;
+}
+
+static void server_audio_stream_add_text(server_tokens & tokens, const llama_vocab * vocab, const std::string & text, bool add_special) {
+    if (text.empty() && !add_special) {
+        return;
+    }
+    llama_tokens ids = common_tokenize(vocab, text, add_special, true);
+    for (llama_token id : ids) {
+        tokens.push_back(id);
+    }
+}
+
+std::unique_ptr<server_res_generator> server_routes::handle_audio_stream(const server_http_req & req) {
+    auto res = create_response();
+
+    try {
+        if (!ctx_server.mctx || !meta->has_inp_audio) {
+            throw std::runtime_error("audio input is not supported - provide a Qwen3-ASR mmproj");
+        }
+
+        json body = json::parse(req.body);
+        const std::string stream_id = json_value(body, "stream_id", std::string());
+        if (stream_id.empty()) {
+            throw std::invalid_argument("'stream_id' is required");
+        }
+
+        const bool stream_reset = json_value(body, "stream_reset", false);
+        const bool audio_final  = json_value(body, "audio_final",  false);
+        const int unfixed_token_num = std::max(0, json_value(body, "unfixed_token_num", 5));
+        const size_t audio_commit_mel_frames = (size_t) std::max(0, json_value(body, "audio_commit_mel_frames", 800));
+
+        auto & session = audio_streams[stream_id];
+        if (session.mtmd_state == nullptr) {
+            session.mtmd_state = mtmd_audio_stream_init(ctx_server.mctx);
+            if (session.mtmd_state == nullptr) {
+                throw std::runtime_error("failed to create Qwen3-ASR audio stream");
+            }
+        }
+        if (stream_reset) {
+            mtmd_audio_stream_reset(session.mtmd_state);
+            session.raw_token_ids.clear();
+            session.text.clear();
+            session.last_slot_id = -1;
+            session.generation = 0;
+        }
+
+        std::vector<float> pcm;
+        const std::string audio_b64 = json_value(body, "audio_data", std::string());
+        const std::string audio_format = json_value(body, "audio_format", std::string("wav"));
+        if (!audio_b64.empty()) {
+            raw_buffer decoded = server_audio_stream_base64_decode(audio_b64);
+            if (audio_format == "wav" || audio_format == "mp3") {
+                mtmd_bitmap * bmp = mtmd_helper_bitmap_init_from_buf(ctx_server.mctx, decoded.data(), decoded.size());
+                if (bmp == nullptr || !mtmd_bitmap_is_audio(bmp)) {
+                    if (bmp) {
+                        mtmd_bitmap_free(bmp);
+                    }
+                    throw std::runtime_error("failed to decode audio_data");
+                }
+                const size_t n_bytes = mtmd_bitmap_get_n_bytes(bmp);
+                if (n_bytes % sizeof(float) != 0) {
+                    mtmd_bitmap_free(bmp);
+                    throw std::runtime_error("decoded audio is not f32 PCM");
+                }
+                const float * data = (const float *) mtmd_bitmap_get_data(bmp);
+                pcm.assign(data, data + n_bytes / sizeof(float));
+                mtmd_bitmap_free(bmp);
+            } else if (audio_format == "pcm_f32le") {
+                if (decoded.size() % sizeof(float) != 0) {
+                    throw std::invalid_argument("pcm_f32le audio_data size must be a multiple of sizeof(float)");
+                }
+                const float * data = (const float *) decoded.data();
+                pcm.assign(data, data + decoded.size() / sizeof(float));
+            } else {
+                throw std::invalid_argument("audio_format must be 'wav', 'mp3', or 'pcm_f32le'");
+            }
+        }
+
+        mtmd_audio_stream_stats stream_stats {};
+        int32_t append_res = mtmd_audio_stream_append(
+                ctx_server.mctx,
+                session.mtmd_state,
+                pcm.data(),
+                pcm.size(),
+                audio_final,
+                audio_commit_mel_frames,
+                &stream_stats);
+        if (append_res != 0) {
+            throw std::runtime_error("failed to append audio to stream");
+        }
+
+        if (mtmd_audio_stream_get_n_chunks(session.mtmd_state) == 0 && !audio_final) {
+            res->ok({
+                {"stream_id", stream_id},
+                {"delta", ""},
+                {"text", session.text},
+                {"audio_final", audio_final},
+                {"profile", {
+                    {"new_samples", stream_stats.new_samples},
+                    {"new_mel_frames", stream_stats.new_mel_frames},
+                    {"new_audio_tokens", stream_stats.new_audio_tokens},
+                    {"reused_audio_tokens", stream_stats.reused_audio_tokens},
+                    {"reused_llm_positions", 0},
+                    {"audio_commit_mel_frames", audio_commit_mel_frames},
+                    {"t_preprocess_ms", stream_stats.t_preprocess_ms},
+                    {"t_encode_ms", stream_stats.t_encode_ms},
+                }},
+            });
+            return res;
+        }
+
+        llama_tokens prefix_ids;
+        if (!session.raw_token_ids.empty()) {
+            const size_t keep = audio_final
+                    ? session.raw_token_ids.size()
+                    : session.raw_token_ids.size() - std::min<size_t>(session.raw_token_ids.size(), unfixed_token_num);
+            prefix_ids.assign(session.raw_token_ids.begin(), session.raw_token_ids.begin() + keep);
+        }
+        const std::string prefix_text = prefix_ids.empty() ? "" : common_detokenize(ctx_server.vocab, prefix_ids, false);
+
+        std::string prompt_text = json_value(body, "prompt", std::string());
+        std::string language    = json_value(body, "language", std::string());
+        if (prompt_text.empty()) {
+            const common_chat_prompt_preset preset = common_chat_get_asr_prompt(meta->chat_params.tmpls.get());
+            prompt_text = preset.user;
+        }
+        if (!language.empty()) {
+            prompt_text += string_format(" (language: %s)", language.c_str());
+        }
+        prompt_text += get_media_marker();
+
+        const bool reuse_stream_slot = session.last_slot_id >= 0;
+
+        json chat_body = body;
+        chat_body["stream"] = false;
+        chat_body["return_tokens"] = true;
+        chat_body["cache_prompt"] = reuse_stream_slot;
+        chat_body["messages"] = json::array({{
+            {"role", "user"},
+            {"content", prompt_text},
+        }});
+        if (reuse_stream_slot) {
+            chat_body["id_slot"] = session.last_slot_id;
+        }
+
+        std::vector<raw_buffer> unused_files;
+        json task_data = oaicompat_chat_params_parse(chat_body, meta->chat_params, unused_files);
+        task_data["stream"] = false;
+        task_data["return_tokens"] = true;
+        task_data["cache_prompt"] = reuse_stream_slot;
+        if (reuse_stream_slot) {
+            task_data["id_slot"] = session.last_slot_id;
+        }
+        if (body.contains("max_tokens")) {
+            task_data["max_tokens"] = body["max_tokens"];
+        }
+        if (body.contains("temperature")) {
+            task_data["temperature"] = body["temperature"];
+        }
+
+        std::string rendered_prompt = task_data.at("prompt").get<std::string>();
+        const std::string marker = get_media_marker();
+        const size_t marker_pos = rendered_prompt.find(marker);
+        if (marker_pos == std::string::npos) {
+            throw std::runtime_error("rendered prompt does not contain media marker");
+        }
+
+        server_tokens input_tokens;
+        input_tokens.has_mtmd = true;
+        server_audio_stream_add_text(input_tokens, ctx_server.vocab, rendered_prompt.substr(0, marker_pos), true);
+        server_audio_stream_add_text(input_tokens, ctx_server.vocab, mtmd_audio_get_start_marker(ctx_server.mctx), false);
+        const size_t n_audio_chunks = mtmd_audio_stream_get_n_chunks(session.mtmd_state);
+        for (size_t i = 0; i < n_audio_chunks; ++i) {
+            const mtmd_input_chunk * chunk = mtmd_audio_stream_get_chunk(session.mtmd_state, i);
+            input_tokens.push_back(chunk);
+        }
+        server_audio_stream_add_text(input_tokens, ctx_server.vocab, mtmd_audio_get_end_marker(ctx_server.mctx), false);
+        server_audio_stream_add_text(input_tokens, ctx_server.vocab, rendered_prompt.substr(marker_pos + marker.size()) + prefix_text, false);
+
+        auto completion_id = gen_chatcmplid();
+        auto & rd = res->rd;
+        server_task task = server_task(SERVER_TASK_TYPE_COMPLETION);
+        task.id = rd.get_new_id();
+        task.tokens = std::move(input_tokens);
+        task.params = server_task::params_from_json_cmpl(
+                ctx_server.vocab,
+                params,
+                meta->slot_n_ctx,
+                meta->logit_bias_eog,
+                task_data);
+        task.id_slot = json_value(task_data, "id_slot", -1);
+        task.params.res_type = TASK_RESPONSE_TYPE_NONE;
+        task.params.oaicompat_cmpl_id = completion_id;
+        task.params.oaicompat_model = meta->model_name;
+        task.params.return_tokens = true;
+        task.params.stream = false;
+        task.params.cache_prompt = reuse_stream_slot;
+
+        std::vector<server_task> tasks;
+        tasks.push_back(std::move(task));
+        rd.post_tasks(std::move(tasks));
+
+        auto all_results = rd.wait_for_all(req.should_stop);
+        if (all_results.is_terminated) {
+            return res;
+        }
+        if (all_results.error) {
+            res->error(all_results.error->to_json());
+            return res;
+        }
+        if (all_results.results.empty()) {
+            throw std::runtime_error("audio stream generation returned no result");
+        }
+
+        auto * final = dynamic_cast<server_task_result_cmpl_final *>(all_results.results[0].get());
+        if (final == nullptr) {
+            throw std::runtime_error("audio stream generation returned unexpected result type");
+        }
+
+        session.raw_token_ids = prefix_ids;
+        session.raw_token_ids.insert(session.raw_token_ids.end(), final->tokens.begin(), final->tokens.end());
+        session.text = prefix_text + final->content;
+        session.last_slot_id = final->id_slot;
+        session.generation++;
+
+        res->ok({
+            {"stream_id", stream_id},
+            {"delta", final->content},
+            {"text", session.text},
+            {"audio_final", audio_final},
+            {"generation", session.generation},
+            {"id_slot", final->id_slot},
+            {"timings", final->timings.to_json()},
+            {"profile", {
+                {"new_samples", stream_stats.new_samples},
+                {"new_mel_frames", stream_stats.new_mel_frames},
+                {"new_audio_tokens", stream_stats.new_audio_tokens},
+                {"reused_audio_tokens", stream_stats.reused_audio_tokens},
+                {"reused_llm_positions", final->n_prompt_tokens_cache},
+                {"audio_commit_mel_frames", audio_commit_mel_frames},
+                {"t_preprocess_ms", stream_stats.t_preprocess_ms},
+                {"t_encode_ms", stream_stats.t_encode_ms},
+                {"prompt_cache_tokens", final->n_prompt_tokens_cache},
+                {"prompt_processed_tokens", final->timings.prompt_n},
+                {"rollback_tokens", audio_final ? 0 : unfixed_token_num},
+            }},
+        });
+    } catch (const std::exception & e) {
+        res->error(format_error_response(e.what(), ERROR_TYPE_INVALID_REQUEST));
+    }
+
+    return res;
+}
+
 std::unique_ptr<server_res_generator> server_routes::create_response(bool bypass_sleep) {
     return std::make_unique<server_res_generator>(queue_tasks, queue_results, params.sleep_idle_seconds, bypass_sleep);
 }
@@ -3687,6 +3994,12 @@ server_routes::server_routes(const common_params & params, server_context & ctx_
           queue_tasks(ctx_server.impl->queue_tasks),
           queue_results(ctx_server.impl->queue_results) {
     init_routes();
+}
+
+server_routes::~server_routes() {
+    for (auto & it : audio_streams) {
+        mtmd_audio_stream_free(it.second.mtmd_state);
+    }
 }
 
 void server_routes::init_routes() {
@@ -4115,6 +4428,10 @@ void server_routes::init_routes() {
             body_parsed,
             files,
             TASK_RESPONSE_TYPE_OAI_ASR);
+    };
+
+    this->post_audio_stream = [this](const server_http_req & req) {
+        return handle_audio_stream(req);
     };
 
     this->post_anthropic_messages = [this](const server_http_req & req) {

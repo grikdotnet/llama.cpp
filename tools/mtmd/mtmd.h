@@ -61,6 +61,7 @@ enum mtmd_input_chunk_type {
 struct mtmd_context;
 struct mtmd_bitmap;
 struct mtmd_image_tokens;
+struct mtmd_audio_stream_state;
 struct mtmd_input_chunk;
 struct mtmd_input_chunks;
 
@@ -77,9 +78,22 @@ struct mtmd_input_text {
 typedef struct mtmd_context      mtmd_context;
 typedef struct mtmd_bitmap       mtmd_bitmap;
 typedef struct mtmd_image_tokens mtmd_image_tokens;
+typedef struct mtmd_audio_stream_state mtmd_audio_stream_state;
 typedef struct mtmd_input_chunk  mtmd_input_chunk;
 typedef struct mtmd_input_chunks mtmd_input_chunks;
 typedef struct mtmd_input_text   mtmd_input_text;
+
+struct mtmd_audio_stream_stats {
+    size_t total_samples;
+    size_t new_samples;
+    size_t total_mel_frames;
+    size_t new_mel_frames;
+    size_t total_audio_tokens;
+    size_t new_audio_tokens;
+    size_t reused_audio_tokens;
+    int64_t t_preprocess_ms;
+    int64_t t_encode_ms;
+};
 
 struct mtmd_context_params {
     bool use_gpu;
@@ -127,6 +141,23 @@ MTMD_API bool mtmd_support_audio(const mtmd_context * ctx);
 // get audio sample rate in Hz, for example 16000 for Whisper
 // return -1 if audio is not supported
 MTMD_API int mtmd_get_audio_sample_rate(const mtmd_context * ctx);
+
+// Experimental append-only audio stream API.
+// Only Qwen3-ASR audio projectors are supported. Non-streaming audio APIs are unchanged.
+MTMD_API mtmd_audio_stream_state * mtmd_audio_stream_init(mtmd_context * ctx);
+MTMD_API void mtmd_audio_stream_reset(mtmd_audio_stream_state * state);
+MTMD_API void mtmd_audio_stream_free(mtmd_audio_stream_state * state);
+MTMD_API int32_t mtmd_audio_stream_append(mtmd_context * ctx,
+                                          mtmd_audio_stream_state * state,
+                                          const float * samples,
+                                          size_t n_samples,
+                                          bool final,
+                                          size_t commit_mel_frames,
+                                          struct mtmd_audio_stream_stats * stats);
+MTMD_API size_t mtmd_audio_stream_get_n_chunks(const mtmd_audio_stream_state * state);
+MTMD_API const mtmd_input_chunk * mtmd_audio_stream_get_chunk(const mtmd_audio_stream_state * state, size_t idx);
+MTMD_API const char * mtmd_audio_get_start_marker(const mtmd_context * ctx);
+MTMD_API const char * mtmd_audio_get_end_marker(const mtmd_context * ctx);
 
 // mtmd_bitmap
 //

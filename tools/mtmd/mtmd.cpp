@@ -72,12 +72,14 @@ using mtmd_image_tokens_ptr = std::unique_ptr<mtmd_image_tokens>;
 struct mtmd_audio_tokens {
     uint32_t n_tokens; // number of tokens
     clip_image_f32_batch batch_f32; // preprocessed image patches
+    std::vector<float> precomputed_embd;
     std::string id; // optional user-defined ID, useful for KV cache tracking
 
     mtmd_audio_tokens clone() {
         return mtmd_audio_tokens{
             n_tokens,
             batch_f32.clone(),
+            precomputed_embd,
             id
         };
     }
@@ -93,6 +95,16 @@ struct mtmd_input_chunk {
 
 struct mtmd_input_chunks {
     std::vector<mtmd_input_chunk> entries;
+};
+
+struct mtmd_audio_stream_state {
+    std::vector<float> samples;
+    std::vector<mtmd_input_chunk> chunks;
+    size_t total_mel_frames = 0;
+    size_t encoded_mel_frames = 0;
+    size_t commit_mel_frames = 800;
+    size_t total_audio_tokens = 0;
+    uint64_t next_chunk_id = 0;
 };
 
 // slice template, used by some llava-uhd models to correctly place the special tokens around image embeddings
@@ -1065,6 +1077,18 @@ int32_t mtmd_encode_chunk(mtmd_context * ctx, const mtmd_input_chunk * chunk) {
         }
         int n_mmproj_embd = ctx->n_embd_text;
         ctx->image_embd_v.resize(chunk->tokens_audio->n_tokens * n_mmproj_embd);
+        if (!chunk->tokens_audio->precomputed_embd.empty()) {
+            const size_t expected = (size_t) chunk->tokens_audio->n_tokens * n_mmproj_embd;
+            if (chunk->tokens_audio->precomputed_embd.size() != expected) {
+                LOG_ERR("%s: invalid precomputed audio embedding size: expected %zu, got %zu\n",
+                        __func__, expected, chunk->tokens_audio->precomputed_embd.size());
+                return 1;
+            }
+            std::copy(chunk->tokens_audio->precomputed_embd.begin(),
+                      chunk->tokens_audio->precomputed_embd.end(),
+                      ctx->image_embd_v.begin());
+            return 0;
+        }
         bool ok = clip_image_batch_encode(
             ctx->ctx_a,
             ctx->n_threads,
@@ -1075,6 +1099,262 @@ int32_t mtmd_encode_chunk(mtmd_context * ctx, const mtmd_input_chunk * chunk) {
 
     LOG_ERR("%s: unknown chunk type %d\n", __func__, (int)chunk->type);
     return 1;
+}
+
+static mtmd_input_chunk mtmd_make_precomputed_audio_chunk(
+        mtmd_context * ctx,
+        mtmd_audio_mel && mel_spec,
+        std::vector<float> && embd,
+        uint64_t chunk_id) {
+    clip_image_f32_ptr mel_f32(clip_image_f32_init());
+    mel_f32->nx  = mel_spec.n_len;
+    mel_f32->ny  = mel_spec.n_mel;
+    mel_f32->buf = std::move(mel_spec.data);
+
+    const size_t n_tokens = clip_n_output_tokens(ctx->ctx_a, mel_f32.get());
+
+    clip_image_f32_batch batch_f32;
+    batch_f32.is_audio = true;
+    batch_f32.entries.push_back(std::move(mel_f32));
+
+    mtmd_audio_tokens_ptr audio_tokens(new mtmd_audio_tokens);
+    audio_tokens->n_tokens = n_tokens;
+    audio_tokens->batch_f32 = std::move(batch_f32);
+    audio_tokens->precomputed_embd = std::move(embd);
+    audio_tokens->id = string_format("mtmd-audio-stream-%" PRIu64 "-%u", chunk_id, (unsigned)n_tokens);
+
+    return mtmd_input_chunk{
+        MTMD_INPUT_CHUNK_TYPE_AUDIO,
+        {},
+        nullptr,
+        std::move(audio_tokens),
+    };
+}
+
+static size_t mtmd_audio_stream_total_mel_frames(const std::vector<mtmd_audio_mel> & mel_spec_chunks) {
+    size_t total = 0;
+    for (const auto & mel : mel_spec_chunks) {
+        total += mel.n_len_org;
+    }
+    return total;
+}
+
+static mtmd_audio_mel mtmd_audio_stream_slice_mel(
+        const std::vector<mtmd_audio_mel> & mel_spec_chunks,
+        size_t frame_offset,
+        size_t n_frames) {
+    const int chunk_size = 100;
+
+    mtmd_audio_mel out;
+    out.n_mel = mel_spec_chunks.empty() ? 0 : mel_spec_chunks.front().n_mel;
+    out.n_len_org = (int)n_frames;
+    out.n_len = (int)(((n_frames + chunk_size - 1) / chunk_size) * chunk_size);
+    out.data.assign((size_t)out.n_mel * out.n_len, 0.0f);
+
+    size_t copied = 0;
+    size_t global_base = 0;
+    for (const auto & src : mel_spec_chunks) {
+        const size_t src_begin = global_base;
+        const size_t src_end = global_base + src.n_len_org;
+        global_base = src_end;
+
+        const size_t dst_begin = frame_offset + copied;
+        if (dst_begin >= src_end || dst_begin < src_begin) {
+            continue;
+        }
+
+        const size_t src_off = dst_begin - src_begin;
+        const size_t can_copy = std::min(n_frames - copied, (size_t)src.n_len_org - src_off);
+        for (int m = 0; m < out.n_mel; ++m) {
+            std::copy(src.data.begin() + (size_t)m * src.n_len + src_off,
+                      src.data.begin() + (size_t)m * src.n_len + src_off + can_copy,
+                      out.data.begin() + (size_t)m * out.n_len + copied);
+        }
+
+        copied += can_copy;
+        if (copied == n_frames) {
+            break;
+        }
+    }
+
+    return out;
+}
+
+static bool mtmd_audio_stream_encode_mel(
+        mtmd_context * ctx,
+        mtmd_audio_stream_state * state,
+        mtmd_audio_mel && mel_spec,
+        size_t * n_tokens_out) {
+    clip_image_f32_ptr mel_f32(clip_image_f32_init());
+    mel_f32->nx  = mel_spec.n_len;
+    mel_f32->ny  = mel_spec.n_mel;
+    mel_f32->buf = mel_spec.data;
+    const size_t n_tokens = clip_n_output_tokens(ctx->ctx_a, mel_f32.get());
+
+    clip_image_f32_batch batch_f32;
+    batch_f32.is_audio = true;
+    batch_f32.entries.push_back(std::move(mel_f32));
+
+    std::vector<float> embd(n_tokens * ctx->n_embd_text);
+    bool ok = clip_image_batch_encode(ctx->ctx_a, ctx->n_threads, &batch_f32, embd.data());
+    if (!ok) {
+        return false;
+    }
+
+    state->total_audio_tokens += n_tokens;
+    state->chunks.emplace_back(mtmd_make_precomputed_audio_chunk(
+                ctx, std::move(mel_spec), std::move(embd), state->next_chunk_id++));
+    if (n_tokens_out) {
+        *n_tokens_out = n_tokens;
+    }
+    return true;
+}
+
+mtmd_audio_stream_state * mtmd_audio_stream_init(mtmd_context * ctx) {
+    if (!ctx || !ctx->ctx_a) {
+        return nullptr;
+    }
+    if (clip_get_projector_type(ctx->ctx_a) != PROJECTOR_TYPE_QWEN3A) {
+        LOG_ERR("%s: audio streaming is currently only supported for Qwen3-ASR projectors\n", __func__);
+        return nullptr;
+    }
+    return new mtmd_audio_stream_state();
+}
+
+void mtmd_audio_stream_reset(mtmd_audio_stream_state * state) {
+    if (!state) {
+        return;
+    }
+    state->samples.clear();
+    state->chunks.clear();
+    state->total_mel_frames = 0;
+    state->encoded_mel_frames = 0;
+    state->commit_mel_frames = 800;
+    state->total_audio_tokens = 0;
+    state->next_chunk_id = 0;
+}
+
+void mtmd_audio_stream_free(mtmd_audio_stream_state * state) {
+    delete state;
+}
+
+int32_t mtmd_audio_stream_append(
+        mtmd_context * ctx,
+        mtmd_audio_stream_state * state,
+        const float * samples,
+        size_t n_samples,
+        bool final,
+        size_t commit_mel_frames,
+        mtmd_audio_stream_stats * stats) {
+    if (!ctx || !state || !ctx->ctx_a || !ctx->audio_preproc) {
+        return 1;
+    }
+    if (clip_get_projector_type(ctx->ctx_a) != PROJECTOR_TYPE_QWEN3A) {
+        LOG_ERR("%s: audio streaming is currently only supported for Qwen3-ASR projectors\n", __func__);
+        return 1;
+    }
+    if (n_samples > 0 && samples == nullptr) {
+        return 1;
+    }
+
+    mtmd_audio_stream_stats local_stats {};
+    local_stats.new_samples = n_samples;
+    const size_t old_mel_frames = state->total_mel_frames;
+    const size_t old_audio_tokens = state->total_audio_tokens;
+    if (commit_mel_frames == 0) {
+        commit_mel_frames = 800;
+    }
+    commit_mel_frames = std::max<size_t>(100, std::min<size_t>(800, commit_mel_frames));
+    commit_mel_frames = ((commit_mel_frames + 99) / 100) * 100;
+    if (state->encoded_mel_frames > 0 && state->commit_mel_frames != commit_mel_frames) {
+        LOG_ERR("%s: commit_mel_frames cannot change within a stream (%zu != %zu)\n",
+                __func__, commit_mel_frames, state->commit_mel_frames);
+        return 1;
+    }
+    state->commit_mel_frames = commit_mel_frames;
+
+    if (n_samples > 0) {
+        state->samples.insert(state->samples.end(), samples, samples + n_samples);
+    }
+    local_stats.total_samples = state->samples.size();
+
+    const int64_t t_pre_0 = ggml_time_ms();
+    std::vector<mtmd_audio_mel> mel_spec_chunks;
+    if (!state->samples.empty()) {
+        bool ok = ctx->audio_preproc->preprocess(state->samples.data(), state->samples.size(), mel_spec_chunks);
+        if (!ok) {
+            LOG_ERR("%s: unable to preprocess streaming audio\n", __func__);
+            return 2;
+        }
+    }
+    local_stats.t_preprocess_ms = ggml_time_ms() - t_pre_0;
+
+    const size_t available_mel_frames = mtmd_audio_stream_total_mel_frames(mel_spec_chunks);
+    const size_t stable_mel_frames = final
+            ? available_mel_frames
+            : (available_mel_frames / commit_mel_frames) * commit_mel_frames;
+    if (stable_mel_frames < state->encoded_mel_frames) {
+        LOG_ERR("%s: streaming mel frame count regressed from %zu to %zu\n",
+                __func__, state->encoded_mel_frames, stable_mel_frames);
+        return 2;
+    }
+
+    local_stats.total_mel_frames = stable_mel_frames;
+    local_stats.new_mel_frames = local_stats.total_mel_frames > old_mel_frames
+            ? local_stats.total_mel_frames - old_mel_frames
+            : 0;
+
+    const int64_t t_enc_0 = ggml_time_ms();
+    for (size_t frame = state->encoded_mel_frames; frame < stable_mel_frames; frame += commit_mel_frames) {
+        const size_t n_frames = std::min(commit_mel_frames, stable_mel_frames - frame);
+        mtmd_audio_mel mel_spec = mtmd_audio_stream_slice_mel(mel_spec_chunks, frame, n_frames);
+        size_t n_tokens = 0;
+        bool ok = mtmd_audio_stream_encode_mel(ctx, state, std::move(mel_spec), &n_tokens);
+        if (!ok) {
+            LOG_ERR("%s: unable to encode streaming audio window at mel frame %zu\n", __func__, frame);
+            return 3;
+        }
+    }
+    local_stats.t_encode_ms = ggml_time_ms() - t_enc_0;
+
+    state->encoded_mel_frames = stable_mel_frames;
+    state->total_mel_frames = local_stats.total_mel_frames;
+    local_stats.total_audio_tokens = state->total_audio_tokens;
+    local_stats.new_audio_tokens = state->total_audio_tokens - old_audio_tokens;
+    local_stats.reused_audio_tokens = old_audio_tokens;
+
+    LOG_INF("%s: new_samples=%zu new_mel_frames=%zu new_audio_tokens=%zu reused_audio_tokens=%zu t_preprocess_ms=%" PRId64 " t_encode_ms=%" PRId64 "\n",
+            __func__,
+            local_stats.new_samples,
+            local_stats.new_mel_frames,
+            local_stats.new_audio_tokens,
+            local_stats.reused_audio_tokens,
+            local_stats.t_preprocess_ms,
+            local_stats.t_encode_ms);
+
+    if (stats) {
+        *stats = local_stats;
+    }
+    return 0;
+}
+
+size_t mtmd_audio_stream_get_n_chunks(const mtmd_audio_stream_state * state) {
+    return state ? state->chunks.size() : 0;
+}
+
+const mtmd_input_chunk * mtmd_audio_stream_get_chunk(const mtmd_audio_stream_state * state, size_t idx) {
+    if (!state || idx >= state->chunks.size()) {
+        return nullptr;
+    }
+    return &state->chunks[idx];
+}
+
+const char * mtmd_audio_get_start_marker(const mtmd_context * ctx) {
+    return ctx ? ctx->aud_beg.c_str() : "";
+}
+
+const char * mtmd_audio_get_end_marker(const mtmd_context * ctx) {
+    return ctx ? ctx->aud_end.c_str() : "";
 }
 
 int32_t mtmd_encode(mtmd_context * ctx, const mtmd_image_tokens * image_tokens) {

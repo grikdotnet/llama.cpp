@@ -7,6 +7,8 @@
 #include <nlohmann/json_fwd.hpp>
 
 #include <cstddef>
+#include <cstdint>
+#include <map>
 #include <memory>
 #include <set>
 
@@ -90,6 +92,7 @@ struct server_res_generator;
 
 struct server_routes {
     server_routes(const common_params & params, server_context & ctx_server);
+    ~server_routes();
 
     void init_routes();
 
@@ -112,6 +115,7 @@ struct server_routes {
     server_http_context::handler_t post_chat_completions;
     server_http_context::handler_t post_responses_oai;
     server_http_context::handler_t post_transcriptions_oai;
+    server_http_context::handler_t post_audio_stream;
     server_http_context::handler_t post_anthropic_messages;
     server_http_context::handler_t post_anthropic_count_tokens;
     server_http_context::handler_t post_apply_template;
@@ -134,6 +138,7 @@ private:
             const json & data,
             const std::vector<raw_buffer> & files,
             task_response_type res_type);
+    std::unique_ptr<server_res_generator> handle_audio_stream(const server_http_req & req);
     std::unique_ptr<server_res_generator> handle_slots_save(const server_http_req & req, int id_slot);
     std::unique_ptr<server_res_generator> handle_slots_restore(const server_http_req & req, int id_slot);
     std::unique_ptr<server_res_generator> handle_slots_erase(const server_http_req &, int id_slot);
@@ -148,4 +153,13 @@ private:
     server_queue & queue_tasks;
     server_response & queue_results;
     std::unique_ptr<server_res_generator> create_response(bool bypass_sleep = false);
+
+    struct audio_stream_session {
+        mtmd_audio_stream_state * mtmd_state = nullptr;
+        llama_tokens raw_token_ids;
+        std::string text;
+        int last_slot_id = -1;
+        uint64_t generation = 0;
+    };
+    std::map<std::string, audio_stream_session> audio_streams;
 };
